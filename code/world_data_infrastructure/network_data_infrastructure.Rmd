@@ -1,0 +1,496 @@
+---
+title: "Creation of the Data Infrastructure Dataset"
+author:
+- Marco Giovanni Ferrari
+- Prasiddha Rajaure
+- Stefano Ciampa
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+abstract: This code produces the dataset collecting informations on regional (NUTS2)
+  data infrastructure. We merge different sources regarding regional statistics, electric
+  infrastructure, datacenters, landing points and bathymetric data.
+---
+
+# Introduction
+
+The following code performs the creation of the map of the world data network. In particular it considers cables and cloud datacenters available in the maps provided by TeleGeography[^1]. It aggregates observations at country level in a network where:
+
+[^1]: For subsea cables: <https://www.submarinecablemap.com/>
+
+    For cloud data centers: <https://www.cloudinfrastructuremap.com/>
+
+1.  The ***nodes*** are single countries or territorial area. We define as unique territorial areas as those areas that, conditional being under the same authority, are within the distance of 100Km to one another. In the commented code in `code/world_boundaries_definition.Rmd` we detail how we compute these areas that are then stored in `work_data/world_data_infrastructure/world_boundaries_single_territories.Rmd`.
+
+2.  The ***edges*** are the subsea cables connecting the pair of nodes. The *thickness* of each edge represent the number of cables connecting them. We consider two countries as connected if there exist a cable connecting them *without passing through other countries*. We then sum the number of direct available paths to obtain the measure of the thickness, this allow us to evidence which countries are the so called *choke points* that hold the highest number of connection with the rest of the world. We compute the number of nodes connecting countries in the commented code in `code/world_data_infrastructure/distance_matrix_extraction.Rmd` whose result are stored in `work_data/world_data_infrastructure/distance_dataset.Rds`.
+
+3.  The ***size (radius) of the nodes*** can be either:
+
+    -   The number of total connections that each node has;
+
+    -   The number of data centers present withing that geographical boundary. We consider all the three types of cloud datacenters provided in the TeleGeography Cloud Infrastructure Map[^2]. They are namely:
+
+        -   **Cloud Regions**: groups of data centers that are the primary units in the functioning of the global cloud industry.
+
+        -   **Local Zones**: data centers built with the purpose of serving more remote geographical areas with low latency.
+
+        -   **On Ramps**: data centers that have the purpose to connect the local (and terrestrial) data infrastructure with the global (submarine) one.
+
+        The data on datacenters location are scraped from the webpage of TeleGeography in the code `code/datacenter_location_extraction.Rmd` and stored in the three files, corresponding to each type of datacenter, available in the folder `work_data/datacenters_location`.
+
+[^2]: Source: <https://www.cloudinfrastructuremap.com/>
+
+We plot this network in a world map. In doing so, we consider the spherical shape of earth, in order to accurately reproduce the actual distance between nodes.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggpubr)
+library(maps)
+library(dbscan)
+library(geosphere)
+library(readxl)
+library(sf)
+library(readr)
+library(giscoR)
+library(magrittr)
+library(dplyr)
+library(stringr)
+library(igraph)
+library(Cairo)
+library(lwgeom)
+library(geosphere)
+library(kableExtra)
+```
+
+# Importing data
+
+In this preliminary part we import the data and show how they are initially structure, we proceed also to some preliminary manipulation.
+
+```{r Importing Edges, warning=FALSE, echo = TRUE}
+edges_raw <- readRDS("work_data/world_data_infrastructure/distance_dataset.rds")
+
+edges_raw <- edges_raw %>%
+  rowwise() %>%
+  mutate(
+    node1 = min(c(A, B)),
+    node2 = max(c(A, B))
+  ) %>%
+  ungroup() 
+```
+
+Edges then appear as follow:
+
+```{r Edges Table, echo=FALSE, warning=FALSE}
+edges_raw [1:10,] %>% 
+  kable(format = "latex", 
+        digits = 2, 
+        caption = "Edges Dataset") %>%
+  kable_styling(full_width = TRUE, 
+                bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                 latex_options = "hold_position")
+```
+
+We also have the information on the year of Ready-For-Service of each cable, which we merge to the edge dataset. We can then subset our dataset and see the evolution across time of the global data network.
+
+```{r Importing Cable Features}
+cable_info <- read_excel("raw_data/subsea_cables_location/cable_info.xlsx") %>%
+  drop_na(year)
+
+month_to_quarter <- function(x) {
+  x_lower <- str_to_lower(x)
+  case_when(
+    str_detect(x_lower, "jan|feb|mar") ~ "Q1",
+    str_detect(x_lower, "apr|may|jun") ~ "Q2",
+    str_detect(x_lower, "jul|aug|sep") ~ "Q3",
+    str_detect(x_lower, "oct|nov|dec") ~ "Q4",
+    str_detect(x_lower, "q[1-4]") ~ str_to_upper(x),
+    # When no info on the month is available, we automatically assign Q4
+    TRUE ~ "Q4"
+  )
+}
+
+cable_info <- cable_info %>%
+  mutate(
+    quarter = month_to_quarter(month),
+    quarter = factor(quarter, levels = c("Q1", "Q2", "Q3", "Q4"), ordered = TRUE)
+  ) %>% 
+  relocate(quarter, .after = year) %>%
+  rename(cable = feature_id) %>%
+  select(cable, year, quarter)
+
+edges_raw <- edges_raw %>% 
+  left_join(cable_info, by = join_by(cable)) %>% 
+  drop_na(year)
+```
+
+Since our dataset, which is dated 2022, contains also future and under construction cables, we restrict the dataset to the existing ones (i.e., those ready for service before 2022).
+
+```{r Subsetting To Extisting Cables}
+edges <- edges_raw %>% filter(year < 2022)
+```
+
+For this moment we ignore the effective length of cables and we limit our interest to the number of available direct connections:
+
+```{r Total Edges}
+edges <- edges %>%
+  count(node1, node2, name = "total_cables")
+```
+
+Which can be organized in the form of adjacency matrix:
+
+```{r Adjacency Matrix}
+edges_network <- graph_from_data_frame(edges, directed = FALSE)
+
+edges_adj_matrix <- as.data.frame(as_adjacency_matrix(edges_network, 
+                                                      attr = "total_cables", 
+                                                      sparse = FALSE)) 
+```
+
+```{r Adjacency Matrix Table, echo=FALSE}
+edges_adj_matrix[1:10, 1:10] %>% 
+  kable(format = "latex", 
+        digits = 2, 
+        caption = "Adjacency Matrix (first 10 rows and columns)") %>%
+  kable_styling(full_width = TRUE, 
+                bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                 latex_options = "hold_position")
+```
+
+We import then the position of the territories and extract the centroid to compute the map:
+
+```{r Importing Node Position, warning=FALSE}
+nodes <- readRDS("work_data/world_data_infrastructure/world_boundaries_single_territories.rds")
+
+world_boundaries_single_territories <- nodes
+
+nodes <- nodes %>%
+  st_centroid() %>%
+  mutate(x = st_coordinates(.)[, 1], y = st_coordinates(.)[, 2]) %>%
+  st_set_geometry(NULL) %>%
+  relocate(country_code_n, .after = y ) %>% 
+  select(-country_code)
+```
+
+Then we assign to each node the number of total connections:
+
+```{r Computing Node Size}
+nodes_size <- edges_adj_matrix %>% 
+  mutate(total_connections = rowSums(.)) %>% 
+  select(total_connections) %>% 
+  rownames_to_column(var = "country_code_n") %>% 
+  left_join(nodes, by = join_by(country_code_n))
+```
+
+```{r Node Size Table, echo=FALSE}
+nodes_size[1:10,] %>% 
+  kable(format = "latex", 
+        digits = 2, 
+        caption = "Node Size") %>%
+  kable_styling(full_width = TRUE, 
+                bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                 latex_options = "hold_position")
+```
+
+We also import data on datacenters:
+
+```{r Importing Datacenters, include=TRUE}
+datacenter_count <- readRDS("work_data/datacenters_location/datacenters_count.rds") %>% 
+  select(country_code_n, Total_DataCenters) %>%
+  rename(total_datacenters = Total_DataCenters)
+
+datacenter_count <- datacenter_count %>% 
+  left_join(nodes, by = join_by(country_code_n))
+```
+
+```{r Datacenter Table, echo=FALSE}
+datacenter_count[1:10,] %>% 
+  kable(format = "latex", 
+        digits = 2, 
+        caption = "Node Size") %>%
+  kable_styling(full_width = TRUE, 
+                bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                 latex_options = "hold_position")
+
+```
+
+# Merging nodes and edges
+
+In this second part, we proceed by combining the information available in the those datasets.
+
+```{r Merging Nodes and Edges, include=TRUE}
+colnames(edges) <- c("from", "to", "total_cables")  
+colnames(nodes) <- c( "x", "y", "country_code_n")  
+
+# Joining edges with node coordinates
+edges_sf <- edges %>%
+  left_join(nodes, by = c("from" = "country_code_n")) %>%
+  rename(x1 = x, y1 = y) %>%
+  left_join(nodes, by = c("to" = "country_code_n")) %>%
+  rename(x2 = x, y2 = y) 
+```
+
+In this way we obtain a dataset that for each connection between nodes expresses:
+
+```{r Edges Extremes , echo=FALSE}
+edges_sf[1:10,] %>% 
+  kable(format = "latex", 
+        digits = 2, 
+        caption = "Edges Endpoints") %>%
+  kable_styling(full_width = TRUE, 
+                bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                 latex_options = "hold_position")
+```
+
+We define a function to draw the line connecting two nodes based on the coordinates of the two nodes. This function includes the great-circle path, namely it consider the earth as rounded rather then flat, and draws the lines connecting nodes accordingly.
+
+```{r Drawing Function}
+drawing_paths <- function(x1, y1, x2, y2, n = 20) {
+  # Ensure input is numeric
+  x1 <- as.numeric(x1); y1 <- as.numeric(y1)
+  x2 <- as.numeric(x2); y2 <- as.numeric(y2)
+  
+  # Compute great-circle path
+  coords <- gcIntermediate(c(x1, y1), c(x2, y2), n = n, addStartEnd = TRUE, breakAtDateLine = TRUE)
+  
+  # If coords is composed of two matrix return a multi-linestring
+  # This is the case for those linestrings passing the dateline.
+  
+  if (is.matrix(coords)) {
+    return(st_linestring(coords))
+  } else if (is.list(coords) && length(coords) == 2) {
+    return(st_multilinestring(list(st_linestring(coords[[1]]), st_linestring(coords[[2]]))))
+  } else {
+    return(st_linestring(matrix(nrow = 0, ncol = 2)))  
+  }
+}
+```
+
+Which we appply to our dataframe of endpoints:
+
+```{r Applying Drawing Function}
+edges_sf <- edges_sf %>% 
+  mutate(geometry = st_sfc(mapply(drawing_paths, 
+                                  x1, y1, x2, y2, 
+                                  SIMPLIFY = FALSE), 
+                           crs = 4326)) %>%
+  select(from, to, total_cables, geometry)
+```
+
+# Map creation
+
+We proceed by plotting our for year 2022, and then from the first available data on subsea cables:
+
+```{r World Data Map,  echo = FALSE, fig.height=6, fig.width=9, message=FALSE, warning=FALSE, include.graphic=TRUE}
+
+world_map <- map_data("world")
+
+# Setting a custom palette with light blue for 1 value:
+ggplot() + 
+    geom_sf(data = world_boundaries_single_territories, aes(geometry = geometry), fill = "#FAF6F6",color = "#00344d", linewidth = 0.01) +
+  geom_sf(data = edges_sf, aes(geometry = geometry, linewidth = total_cables), color = "#6AAED6") +
+  scale_linewidth_continuous(range = c(0, 4), name = "Number of cables") +
+  #scale_color_manual(name = "Number of cables", values = c("#D0E1F2", "#B7D4EA", "#94C4DF", "#6AAED6", "#4A98C9", "#2E7EBC", "#1764AB", "#084A91", "#084A91")) +
+# geom_point(data = datacenter_counts, aes(x = x, y = y, size = Total_DataCenters), alpha = 0.5, color = "#64baaa") +
+   geom_point(data = nodes_size, aes(x = x, y = y, size = total_connections), alpha = 0.5, color = "#64baaa") +
+    scale_radius(name = "Number of Total Connections", range = c(0, 10)) +
+  #scale_size_continuous(name = "Number of Datacenters", range = c(0, 10)) +
+  labs(
+    title = "The World Data Network in 2022",
+    subtitle = "Network Visualization of Subsea Cables and Cloud Datacenters of the main Internet players",
+    caption = "Sources: Submarine Cable Map and Cloud Infrastructure Map by Telegeography")+
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, face = "italic"),
+    plot.caption = element_text(hjust = 0.5, size = 8),
+    plot.caption.position = "panel",
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    legend.position = "top", 
+    legend.title = element_text(size = 8),
+    legend.key.size = unit(8, "pt"),
+    legend.text = element_text(size = 8),
+    legend.spacing = unit(8, "pt"),              
+    legend.box = "horizontal",                  
+    legend.box.just = "center",
+    panel.background = element_rect(fill = "#FEFEFE"),
+    plot.background = element_rect(fill = "#F7F7F7"),
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_continuous(breaks = seq(-180, 180, by = 60)) +
+  scale_y_continuous(breaks = seq(-90, 90, by = 30)) + 
+  guides(fill = guide_legend(override.aes = list(size=20)))
+```
+
+#  Cable connections in the history
+
+```{r eval=FALSE, include=FALSE}
+# Setting a custom palette with light blue for 1 value:
+World_Data_Network_02 <- ggplot() + 
+  geom_sf(data = world_boundaries_single_territories, aes(geometry = geometry), fill = "#FAF6F6",color = "#00344d", linewidth = 0.01) +
+  geom_sf(data = edges_sf, aes(geometry = geometry, linewidth = total_cables), color = "#6AAED6") +
+  scale_linewidth_continuous(range = c(0.1, 2), name = "Number of cables") +
+  #scale_color_manual(name = "Number of cables", values = c("#D0E1F2", "#B7D4EA", "#94C4DF", "#6AAED6", "#4A98C9", "#2E7EBC", "#1764AB", "#084A91", "#084A91")) +
+ # geom_point(data = datacenter_counts, aes(x = x, y = y, size = Total_DataCenters), alpha = 0.5, color = "#64baaa") +
+  #scale_size_continuous(name = "Number of Datacenters", range = c(0, 10)) +
+  labs(
+    title = "The World Data Network",
+    subtitle = "Network Visualization of Subsea Cables and Cloud Datacenters of the main Internet players (preliminary version)",
+    caption = "Sources: Submarine Cable Map and Cloud Infrastructure Map by Telegeography")+
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, face = "italic"),
+    plot.caption = element_text(hjust = 0.5, size = 9),
+    plot.caption.position = "panel",
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    legend.position = "top", 
+    legend.title = element_text(size = 9),
+    legend.key.size = unit(9, "pt"),
+    legend.text = element_text(size = 9),
+    legend.spacing = unit(9, "pt"),              
+    legend.box = "horizontal",                  
+    legend.box.just = "center",
+    panel.background = element_rect(fill = "#FEFEFE"),
+    plot.background = element_rect(fill = "#F7F7F7"),
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank()
+  ) +
+  scale_x_continuous(breaks = seq(-180, 180, by = 60)) +
+  scale_y_continuous(breaks = seq(-90, 90, by = 30)) + 
+  guides(fill = guide_legend(override.aes = list(size=20)))
+
+ggsave("output/world_data_infrastructure/World_Data_Network_01.pdf", World_Data_Network_01, scale=1, height=9, width=15,  device = cairo_pdf(), limitsize = FALSE)
+
+ggsave("output/world_data_infrastructure/World_Data_Network_02.pdf", World_Data_Network_02, scale=1, height=9, width=15,  device = cairo_pdf(), limitsize = FALSE)
+```
+
+```{r Data Infrastructure Across Time, echo=FALSE, fig.height=6, fig.width=9, message=FALSE, warning=FALSE, include.graphic=TRUE}
+network_plotting <- function(edges_sf, nodes_size, year) {
+  plot <- ggplot() +
+    geom_sf(
+      data = world_boundaries_single_territories,
+      aes(geometry = geometry),
+      fill = "#FAF6F6",
+      color = "#00344d",
+      linewidth = 0.01
+    ) +
+    geom_sf(
+      data = edges_sf,
+      aes(geometry = geometry,
+          linewidth = total_cables), 
+      color = "#6AAED6"
+    ) +
+    scale_linewidth_continuous(
+      range = c(0, 4),
+      name = "Number of cables",
+      limits = c(0, 13)) +
+    geom_point(
+      data = nodes_size,
+      aes(x = x, y = y, size = total_connections),
+      alpha = 0.5,
+      color = "#64baaa"
+    ) +
+    scale_radius(name = "Number of Total Connections",
+                 range = c(0, 10),
+                 limits = c(0, 100)
+    ) +
+    labs(
+      title = paste0("The World Data Network in ", year),
+      subtitle = "Network Visualization of Subsea Cables and Cloud Datacenters of the main Internet players",
+      caption = "Sources: Submarine Cable Map and Cloud Infrastructure Map by Telegeography"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        size = 15,
+        face = "bold"
+      ),
+      plot.subtitle = element_text(
+        hjust = 0.5,
+        size = 11,
+        face = "italic"
+      ),
+      plot.caption = element_text(hjust = 0.5, size = 8),
+      plot.caption.position = "panel",
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title = element_blank(),
+      legend.position = "top",
+      legend.title = element_text(size = 8),
+      legend.key.size = unit(8, "pt"),
+      legend.text = element_text(size = 8),
+      legend.spacing = unit(8, "pt"),
+      legend.box = "horizontal",
+      legend.box.just = "center",
+      panel.background = element_rect(fill = "#FEFEFE"),
+      plot.background = element_rect(fill = "#F7F7F7"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    ) +
+    scale_x_continuous(breaks = seq(-180, 180, by = 60)) +
+    scale_y_continuous(breaks = seq(-90, 90, by = 30)) +
+    guides(fill = guide_legend(override.aes = list(size = 20)))
+  return(plot)
+  
+}
+
+years <- unique(edges_raw$year)[unique(edges_raw$year) < 2022] %>%
+  as.numeric() %>%
+  sort()
+
+plot_list <- list()
+
+for(year_selected in years) {
+  
+  edges <- edges_raw %>% filter(year < year_selected+1)
+  edges <- edges %>%
+    count(node1, node2, name = "total_cables")
+  
+  edges_network <- graph_from_data_frame(edges, directed = FALSE)
+  
+  edges_adj_matrix <- as.data.frame(as_adjacency_matrix(edges_network, 
+                                                        attr = "total_cables", 
+                                                        sparse = FALSE))
+  
+  nodes_size <- edges_adj_matrix %>%
+    mutate(total_connections = rowSums(.)) %>%
+    select(total_connections) %>%
+    rownames_to_column(var = "country_code_n") %>%
+    left_join(nodes, by = join_by(country_code_n))
+  
+  colnames(edges) <- c("from", "to", "total_cables")
+  colnames(nodes) <- c("x", "y", "country_code_n")
+  
+  edges_sf <- edges %>%
+    left_join(nodes, by = c("from" = "country_code_n")) %>%
+    rename(x1 = x, y1 = y) %>%
+    left_join(nodes, by = c("to" = "country_code_n")) %>%
+    rename(x2 = x, y2 = y)
+  
+  edges_sf <- edges_sf %>%
+    mutate(geometry = st_sfc(mapply(drawing_paths, x1, y1, x2, y2, 
+                                    SIMPLIFY = FALSE),
+                             crs = 4326)) %>%
+    select(from, to, total_cables, geometry) %>% 
+    drop_na(total_cables) %>% 
+    mutate(total_cables = as.integer(total_cables))
+  
+  plot <- network_plotting(edges_sf = edges_sf,
+                   nodes_size = nodes_size,
+                   year = year_selected+1)
+  
+  print(plot)
+  
+  plot_list[[as.character(year_selected+1)]] <- plot
+}
+
+```

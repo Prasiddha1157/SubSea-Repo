@@ -1,0 +1,119 @@
+---
+title: "NUTS2 Map Creation"
+author: "Marco Giovanni Ferrari"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(sf)
+library(viridis)
+library(dplyr)
+library(Cairo)
+
+nuts2_data <- readRDS("work_data/instruments_for_datacenters/nuts2_infrastructure_dataset.Rds")
+
+# Remove remote islands while keeping Svalbard
+nuts2_data <- nuts2_data %>%
+  filter(!(NUTS_ID %in% c("FRY1", "FRY2", "FRY3", "FRY4", "FRY5",
+                          "ES63", "ES64", "PT20", "PT30", "ES70")))
+```
+
+```{r}
+plot_nuts2_map <- function(data, var, title, palette="viridis", unit) {
+  plot <- ggplot(data) +
+    geom_sf(aes_string(fill = var), color = "white", lwd = 0 ) +
+    scale_fill_viridis(option = "mako", direction = -1, na.value = "grey80") +
+    labs(title = paste0(title, " (", unit, ")") , fill = title) +
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "#FEFEFE"),
+      #plot.background = element_rect(fill = "#F7F7F7"),
+      legend.position = "bottom",
+      legend.key.size = unit(15, "pt"),
+      legend.key.width = unit(40, 'pt'),
+      legend.title.position ="top",
+      legend.box.just = "center",
+      legend.text = element_text(size = 8)
+    )
+  
+  ggsave(paste0("output/world_data_infrastructure/EU_Maps/", var, ".pdf"),
+         plot, scale=1, height=10, width=8,  device = cairo_pdf(),
+         limitsize = TRUE)
+  return(plot)
+}
+```
+
+\newpage
+
+```{r message=FALSE, warning=FALSE}
+map_pc_gdp <- plot_nuts2_map(nuts2_data, 
+                             "pc_gdp", 
+                             "Per capita GDP", 
+                             unit = "EUR")
+```
+
+```{r fig.height=7, fig.width=6, fig.align="center"}
+map_pc_gdp
+```
+
+\newpage
+
+```{r  message=FALSE, warning=FALSE}
+map_population<- plot_nuts2_map(nuts2_data,
+                                        "population", 
+                                        "Population", 
+                                        unit = "#")
+```
+
+```{r fig.height=7, fig.width=6, fig.align="center"}
+map_population
+```
+
+\newpage
+
+
+```{r message=FALSE, warning=FALSE}
+map_total_datacenters <- plot_nuts2_map(nuts2_data,
+                                        "total_datacenters", 
+                                        "Total datacenters", 
+                                        unit = "#")
+```
+
+```{r fig.height=7, fig.width=6, fig.align="center"}
+map_total_datacenters
+```
+
+\newpage
+
+```{r message=FALSE, warning=FALSE}
+map_total_hydro_capacity <- plot_nuts2_map(nuts2_data,
+                                           "total_hydro_capacity", 
+                                           "Total Hydro Capacity", 
+                                           unit = "MW")
+```
+
+```{r fig.height=7, fig.width=6, fig.align="center"}
+map_total_hydro_capacity
+```
+
+\newpage
+
+```{r}
+map_landing_count <- plot_nuts2_map(nuts2_data,
+                                    "landing_count",
+                                    "Number of landing submarine cables",
+                                    unit = "#")
+```
+
+```{r fig.height=7, fig.width= 6, fig.align="center" }
+map_landing_count
+```

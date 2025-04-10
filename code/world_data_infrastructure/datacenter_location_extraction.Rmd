@@ -1,0 +1,322 @@
+---
+title: "Creation of the Datacenter Location Dataset"
+author:
+- Marco Giovanni Ferrari
+- Prasiddha Rajaure
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+abstract: ...
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(rvest)
+library(dplyr)
+library(tidygeocoder)
+library(maps)
+library(sf)
+library(ggpubr)
+library(Cairo)
+library(purrr)
+library(stringr)
+library(tidyr)
+library(openxlsx)
+
+# Scraping from TeleGeography
+
+# Extracting Cloud Regions
+html_cloud_regions <- read_html("raw_data/datacenters_location/Cloud Infrastructure Map_Cloud_Regions.htm")
+
+# Extract each result item based on the outermost class
+results_cloud_regions <- html_cloud_regions %>%
+  html_elements(".results-list-item") %>%
+  map_df(~ {
+    # Extract location and country
+    location <- .x %>%
+      html_element("h5") %>%
+      html_text(trim = TRUE)
+    
+    # Extract all service providers in the details section
+    providers <- .x %>%
+      html_elements(".details > div") %>%
+      map_df(~ {
+        # Extract service provider name
+        provider_name <- .x %>%
+          html_element("a") %>%
+          html_text(trim = TRUE)
+        
+        # Extract region details (text after the provider name)
+        region_details <- .x %>%
+          html_text(trim = TRUE) %>%
+          sub(paste0("^", provider_name, ", "), "", .) %>%
+          str_extract("^[^<]+")
+        
+        # Extract zone count
+        zones_count <- .x %>%
+          html_element(".badge") %>%
+          html_text(trim = TRUE)
+        
+        # Extract the identifier or other info if available
+        identifier <- .x %>%
+          html_element(".details-small") %>%
+          html_text(trim = TRUE)
+        
+        # Return as a data frame row
+        tibble(
+          location = location,
+          provider_name = provider_name,
+          region_details = region_details,
+          zones_count = zones_count,
+          identifier = identifier
+        )
+      })
+    
+    providers
+  })
+
+# Extracting location information
+
+# Cohordinates
+results_cloud_regions <- results_cloud_regions %>%
+  geocode(location, method = 'arcgis', lat = latitude , long = longitude)
+
+results_cloud_regions <- results_cloud_regions %>% reverse_geocode(lat = latitude, long = longitude, method = 'arcgis',
+                                       address = country_found, full_results = TRUE)
+
+results_cloud_regions <- results_cloud_regions %>% 
+  select(c(location, 
+           provider_name, 
+           region_details, 
+           zones_count, 
+           identifier, 
+           latitude,
+           longitude,
+           CountryCode)) %>%
+  mutate(country_code =toupper(CountryCode)) %>% select(-CountryCode)
+
+# Using the separate function od dyplr to slice the first element
+results_cloud_regions <- results_cloud_regions %>% 
+  separate(zones_count, into = c("number_of_datacenters"), sep = " ", remove = FALSE, extra = "drop")
+
+results_cloud_regions <- results_cloud_regions %>% mutate(number_of_datacenters = as.numeric(number_of_datacenters)) %>%
+  select(-zones_count)
+
+
+# Allocating firms into blocks
+
+chinese_block <- c("Tencent Cloud", "Alibaba Cloud", "Huawei Cloud")
+us_block <- c("Oracle Cloud", "Microsoft Azure", "Google Cloud", "Amazon Web Services", "IBM Cloud", "Oracle Cloud")
+
+# Defining a simple function to aggregate firm into China vs. US Blocks
+block_extraction <- function(provider_name){
+  if(provider_name %in% chinese_block){
+    return("China")
+  } else if(provider_name %in% us_block){
+    return("USA")
+  } else return("Other")
+}
+
+# Applying the function
+results_cloud_regions <- results_cloud_regions %>% mutate(block = as.factor(sapply(provider_name, block_extraction, USE.NAMES = FALSE)))
+
+# Storing results in a xlsx file
+write_rds(results_cloud_regions, "work_data/datacenters_location/cloud_regions_dataset.rds")
+
+
+# Scraping On Ramps
+
+# Extracting Cloud Regions
+html_on_ramps <- read_html("raw_data/datacenters_location/Cloud Infrastructure Map_On_Ramps.htm")
+
+# Extract each result item based on the outermost class
+results_on_ramps <- html_on_ramps %>%
+  html_elements(".results-list-item") %>%
+  map_df(~ {
+    # Extract location and country
+    location <- .x %>%
+      html_element("h5") %>%
+      html_text(trim = TRUE)
+    
+    # Extract all service providers in the details section
+    providers <- .x %>%
+      html_elements(".details > div") %>%
+      map_df(~ {
+        # Extract service provider name
+        provider_name <- .x %>%
+          html_element("a") %>%
+          html_text(trim = TRUE)
+        
+        # Extract region details (text after the provider name)
+        region_details <- .x %>%
+          html_text(trim = TRUE) %>%
+          sub(paste0("^", provider_name, ", "), "", .) %>%
+          str_extract("^[^<]+")
+        
+        # Extract zone count
+        zones_count <- .x %>%
+          html_element(".badge") %>%
+          html_text(trim = TRUE)
+        
+        # Extract the identifier or other info if available
+        identifier <- .x %>%
+          html_element(".details-small") %>%
+          html_text(trim = TRUE)
+        
+        # Return as a data frame row
+        tibble(
+          location = location,
+          provider_name = provider_name,
+          region_details = region_details,
+          zones_count = zones_count,
+          identifier = identifier
+        )
+      })
+    
+    providers
+  })
+
+results_on_ramps <- results_on_ramps %>%
+  geocode(location, method = 'arcgis', lat = latitude , long = longitude)
+
+results_on_ramps <- results_on_ramps %>% reverse_geocode(lat = latitude, long = longitude, method = 'arcgis',
+                                       address = country_found, full_results = TRUE)
+
+results_on_ramps <- results_on_ramps %>% 
+  select(c(location, 
+           provider_name, 
+           region_details, 
+           identifier, 
+           latitude,
+           longitude,
+           CountryCode)) %>%
+  mutate(country_code = toupper(CountryCode)) %>% select(-CountryCode)
+
+# Applying the function
+results_on_ramps <- results_on_ramps %>% mutate(block = as.factor(sapply(provider_name, block_extraction, USE.NAMES = FALSE)))
+
+
+write_rds(results_on_ramps, "work_data/datacenters_location/on_ramps_dataset.rds")
+
+
+
+# Extracting Local Zones
+
+# Extracting Cloud Regions
+html_local_zones <- read_html("raw_data/datacenters_location/Cloud Infrastructure Map_Local_Zones.htm")
+
+# Extract each result item based on the outermost class
+results_local_zones <- html_local_zones %>%
+  html_elements(".results-list-item") %>%
+  map_df(~ {
+    # Extract location and country
+    location <- .x %>%
+      html_element("h5") %>%
+      html_text(trim = TRUE)
+    
+    # Extract all service providers in the details section
+    providers <- .x %>%
+      html_elements(".details > div") %>%
+      map_df(~ {
+        # Extract service provider name
+        provider_name <- .x %>%
+          html_element("a") %>%
+          html_text(trim = TRUE)
+        
+        # Extract region details (text after the provider name)
+        region_details <- .x %>%
+          html_text(trim = TRUE) %>%
+          sub(paste0("^", provider_name, ", "), "", .) %>%
+          str_extract("^[^<]+")
+        
+        # Extract zone count
+        zones_count <- .x %>%
+          html_element(".badge") %>%
+          html_text(trim = TRUE)
+        
+        # Extract the identifier or other info if available
+        identifier <- .x %>%
+          html_element(".details-small") %>%
+          html_text(trim = TRUE)
+        
+        # Return as a data frame row
+        tibble(
+          location = location,
+          provider_name = provider_name,
+          region_details = region_details,
+          zones_count = zones_count,
+          identifier = identifier
+        )
+      })
+    
+    providers
+  })
+
+results_local_zones <- results_local_zones %>%
+  geocode(location, method = 'arcgis', lat = latitude , long = longitude)
+
+results_local_zones <- results_local_zones %>% reverse_geocode(lat = latitude, long = longitude, method = 'arcgis',
+                                                         address = country_found, full_results = TRUE)
+
+results_local_zones <- results_local_zones %>% 
+  select(c(location, 
+           provider_name, 
+           region_details, 
+           latitude,
+           longitude,
+           CountryCode)) %>%
+  mutate(country_code = toupper(CountryCode)) %>% select(-CountryCode)
+
+# Applying the function
+results_local_zones <- results_local_zones %>% mutate(block = as.factor(sapply(provider_name, block_extraction, USE.NAMES = FALSE)))
+
+
+write_rds(results_local_zones, "work_data/datacenters_location/local_zones_dataset.Rds")
+
+```
+
+We merge then the informations on the the territories defined in the `world_boundaries_definition.Rmd`.
+
+```{r}
+world_boundaries_single_territories <- readRDS("work_data/world_data_infrastructure/world_boundaries_single_territories.rds") 
+
+cloud_regions <- results_cloud_regions %>%
+  select(number_of_datacenters, latitude, longitude) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_join(world_boundaries_single_territories, join = st_within) %>%
+  group_by(country_code_n) %>%
+  summarise(Cloud_Regions = sum(number_of_datacenters), .groups = "drop") %>% 
+  st_drop_geometry()
+
+local_zones <- results_local_zones %>%
+  select(latitude, longitude) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_join(world_boundaries_single_territories, join = st_within) %>%
+  group_by(country_code_n) %>%
+  summarise(Local_Zones = n(), .groups = "drop") %>% 
+  st_drop_geometry()
+
+on_ramps <- results_on_ramps %>%
+  select(latitude, longitude) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_join(world_boundaries_single_territories, join = st_within) %>%
+  group_by(country_code_n) %>%
+  summarise(On_Ramps = n(), .groups = "drop") %>% 
+  st_drop_geometry()
+
+# Merge all data center types
+datacenter_count <- full_join(cloud_regions, local_zones, by = "country_code_n") %>% 
+  full_join(on_ramps, by = "country_code_n") %>%
+  mutate(across(c(Cloud_Regions, Local_Zones, On_Ramps), ~ replace_na(.x, 0))) 
+
+# Integrating the different datasets
+datacenter_count <- datacenter_count %>% 
+  mutate(across(c(Cloud_Regions, Local_Zones, On_Ramps), ~ replace_na(.x, 0))) %>%
+  mutate(Total_DataCenters = Cloud_Regions + Local_Zones + On_Ramps) %>% drop_na()
+
+write_rds(datacenter_count, "work_data/datacenters_location/datacenters_count.rds")
+
+```

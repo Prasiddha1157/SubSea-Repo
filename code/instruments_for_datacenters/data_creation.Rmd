@@ -1,0 +1,259 @@
+---
+title: "Creation of the Data Infrastructure Dataset"
+author:
+  - Marco Giovanni Ferrari
+  - Prasiddha Rajaure
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+abstract: This code produces the dataset collecting informations on regional (NUTS2)
+  data infrastructure. We merge different sources regarding regional statistics, electric
+  infrastructure, datacenters, landing points and bathymetric data.
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(maps)
+library(ggplot2)
+library(dbscan)
+library(geosphere)
+library(readxl)
+library(sf)
+library(readr)
+library(giscoR)
+library(magrittr)
+```
+
+# Introduction
+
+The following code performs the merge of different dataset containing informations on NUTS2 European Regions. In particular in the next sections we construct a datset with, for each NUTS2 contains:
+
+1.  GDP, Population, GDP per Capita, Share of country's GDP, Share of country's population (done);
+2.  The number of datacenters in every region, divided into Cloud Regions, Local Zones and On Ramps (done);
+3.  The number of Hydroelectric Power Plants (done);
+4.  The list and total number of subsea cables landing in that region (done);
+5.  The ruggedness of regional coastline, if existing (WIP).
+
+```{r NUTS Shapefiles, message=FALSE, warning=FALSE, include=FALSE}
+nuts2 <- st_read("raw_data/instrument_for_datacenters/NUTS_RG_20M_2021_3035.shp") %>% 
+  filter(LEVL_CODE == 2)
+
+# Storing separately informations on regions' names
+
+nuts2_dict <- nuts2 %>% 
+  select(c(NUTS_ID, NAME_LATN, NUTS_NAME, geometry)) %>% 
+  st_drop_geometry()
+
+nuts2 <- nuts2 %>% 
+  select(c(NUTS_ID, geometry))
+```
+
+# Regional Statistics
+
+Statistics about NUTS2 regions are available from EUROSTAT[^1] for the European Regions. These must be combined with GDP data for the UK available from the Office for National Statistics[^2]. These datasets suffer from 3 missing observations, namely that of Lichtenstein and Iceland for GDP data, and Northern Ireland for population data. These cases are added manually and their statistics are sourced from Statista. Lastly, EUROSTAT does not provide population data for the Svalbard e Jan Mayen islands, we resort to the data provided by the Swedish Central Bureau of Statistics[^3]:
+
+[^1]: For GDP data: <https://ec.europa.eu/eurostat/databrowser/product/page/nama_10r_2gdp>
+
+    For population data: [https://ec.europa.eu/eurostat/databrowser/view/demo_r_d2jan](https://ec.europa.eu/eurostat/databrowser/view/demo_r_d2jan/default/table?lang=en){.uri}
+
+[^2]: <https://www.ons.gov.uk/economy/grossdomesticproductgdp/datasets/regionalgrossdomesticproductallnutslevelregions>
+
+[^3]: <https://www.ssb.no/en/statbank/table/07429>
+
+```{r message=FALSE, warning=FALSE, include=TRUE, paged.print=TRUE}
+nuts2_GDP <- read_csv("raw_data/instrument_for_datacenters/estat_nama_10r_2gdp_filtered_de.csv")  %>% 
+  filter(TIME_PERIOD == "2019") %>%
+  select(c(geo, TIME_PERIOD, OBS_VALUE)) %>%
+  rename(tot_gdp = OBS_VALUE, time_period = TIME_PERIOD) %>% 
+  mutate(tot_gdp = tot_gdp*1000000) %>% 
+  mutate(country = substr(geo, 1, 2))
+
+# Adding cases for Lichtenstein and Iceland:
+# Original data from Statista are in USD, we convert them using
+# the exchange rate to Euro at 1st Jan 2020: 1$ = 0.9013 Euro. 
+# Alternatively, one cane use that at 1st Jan 2019 = 0.8735 Euro
+
+nuts2_GDP <- nuts2_GDP %>% add_case(
+  geo = "LI00",
+  time_period = 2019,
+  tot_gdp = 6.44*10^9*0.9013,
+  country = "LI"
+) %>% add_case(
+  geo = "IS00",
+  time_period = 2019,
+  tot_gdp = 24.68*10^9*0.9013,
+  country = "IS"
+)
+
+nuts2_POP <- read_csv("raw_data/instrument_for_datacenters/estat_demo_r_d2jan_filtered_de.csv") %>% 
+  filter(TIME_PERIOD == "2019") %>%
+  select(c(geo, TIME_PERIOD, OBS_VALUE)) %>% 
+  rename(population = OBS_VALUE, time_period = TIME_PERIOD) %>% 
+  mutate(country = substr(geo, 1, 2))
+
+
+# Adding cases for Northern Ireland:
+nuts2_POP <- nuts2_POP %>% add_row(
+  geo = "UKN0",
+  time_period = 2019,
+  population = 1898500,
+  country = "UK"
+) %>% mutate(population = case_when(geo == "NO0B" ~ 2379, 
+                                    .default = population))
+
+
+nuts2_GDP_UK <- read_excel("raw_data/instrument_for_datacenters/regionalgrossdomesticproductgdpbyallitlregions.xlsx", sheet = "Table 5", skip = 1) 
+
+# Pound to euro beginning 2019: 1.1449	
+# Pound to euro beginning 2020: 1.1896	
+
+nuts2_GDP_UK <- nuts2_GDP_UK %>% select("ITL","ITL code","2019") %>%
+  pivot_longer(cols = "2019", names_to = "time_period") %>% 
+  filter(ITL == "ITL2") %>% 
+  rename(tot_gdp = value,
+         geo = `ITL code`
+         ) %>%
+  mutate(tot_gdp = tot_gdp*1.1896*1000000,
+         geo = sub("^..", "UK", geo),
+         country = "UK",
+         time_period = as.numeric(time_period)
+         ) %>% 
+  select(-ITL)
+  
+
+nuts2_GDP <- nuts2_GDP %>% bind_rows(nuts2_GDP_UK)
+
+# Country aggregates
+
+national_STAT <- nuts2_GDP %>% 
+  left_join(nuts2_POP, join_by(geo,country ,time_period)) %>% 
+  group_by(country) %>%
+  summarize(country_gdp = sum(tot_gdp, na.rm = TRUE), 
+            country_pop = sum(population, na.rm = TRUE))
+
+# Final dataset
+
+nuts2_STAT <- nuts2_GDP %>% 
+  left_join(nuts2_POP, join_by(geo,country ,time_period)) %>% 
+  left_join(national_STAT) %>% 
+  mutate(tot_gdp = tot_gdp,
+         population = population,
+         pc_gdp = tot_gdp/population,
+         country_gdp_share = tot_gdp/country_gdp,
+         country_pop_share = population/country_pop,
+         country_pc_gdp = country_gdp/country_pop,
+         country_pc_gdp_share = country_pc_gdp*country_gdp_share
+         )   %>% 
+  rename(NUTS_ID = geo) %>% drop_na()
+```
+
+# Hydro-power Plant Data
+
+We leverage on the Global Power Plant Database[^4].
+
+[^4]: [https://datasets.wri.org/datasets/global-power-plant-database](https://datasets.wri.org/datasets/global-power-plant-database?map=eyJ2aWV3U3RhdGUiOnsibGF0aXR1ZGUiOjEuMjAwMTMzMDQ1OTQ5MjE1MiwibG9uZ2l0dWRlIjotNi4xMTYxNzgyNDc1NjUyMTYsInpvb20iOjIuNTAyNDk4NjM3NDEzMjUsImJlYXJpbmciOjAsInBpdGNoIjowLCJwYWRkaW5nIjp7InRvcCI6MCwiYm90dG9tIjowLCJsZWZ0IjowLCJyaWdodCI6MH19LCJiYXNlbWFwIjoibGlnaHQiLCJib3VuZGFyaWVzIjpmYWxzZSwibGFiZWxzIjoiZGFyayIsImFjdGl2ZUxheWVyR3JvdXBzIjpbeyJkYXRhc2V0SWQiOiI1MzYyM2RmZC0zZGY2LTRmMTUtYTA5MS02NzQ1N2NkYjU3MWYiLCJsYXllcnMiOlsiMmE2OTQyODktZmVjOS00YmZlLWE2ZDItNTZjMzg2NGVjMzQ5Il19XSwiYm91bmRzIjp7ImJib3giOm51bGwsIm9wdGlvbnMiOnt9fSwibGF5ZXJzUGFyc2VkIjpbWyIyYTY5NDI4OS1mZWM5LTRiZmUtYTZkMi01NmMzODY0ZWMzNDkiLHsidmlzaWJpbGl0eSI6dHJ1ZSwiYWN0aXZlIjp0cnVlLCJvcGFjaXR5IjoxLCJ6SW5kZXgiOjExfV1dfQ%3D%3D){.uri}
+
+```{r message=FALSE, warning=FALSE, paged.print=TRUE}
+# Importing data from all the types of plants
+global_power_plant_database <- read.csv("raw_data/instrument_for_datacenters/global_power_plant_database.csv") %>% 
+  select(c("country",
+           "country_long",
+           "name","gppd_idnr",
+           "capacity_mw",
+           "latitude",
+           "longitude",
+           "primary_fuel", 
+           "commissioning_year")
+         )
+
+# Restricting to hydro-power plants
+hydro_plant_database <- global_power_plant_database %>% filter(primary_fuel == "Hydro")
+```
+
+The dataset does not provide a NUTS2 classification, but just the geographical cohordinates. Hence, it is necessary to retrieve this information by intersecting the location with the border shapefiles of NUTS2 regions.
+
+```{r message=FALSE, warning=FALSE}
+# Transforming cohordinates into NUTS2 using shapefiles
+hydro_plant_database <- st_as_sf(hydro_plant_database, coords = c("longitude", "latitude"), crs = 4326)
+
+hydro_plant_database <- st_transform(hydro_plant_database, st_crs(nuts2))
+
+hydro_plant_database <- st_join(hydro_plant_database, nuts2, left = TRUE) %>% st_drop_geometry()
+
+# And finally summarizing data at NUTS2 level
+regional_hydro <- hydro_plant_database %>% filter(!is.na(NUTS_ID)) %>% group_by(NUTS_ID) %>%
+  summarize(total_hydro_capacity = sum(capacity_mw),
+          total_hydro_plants = n(),
+          avg_hydro_capacity = mean(capacity_mw),
+          med_hydro_capacity = median(capacity_mw)
+          ) %>% right_join(nuts2)
+```
+
+# Importing and Locating Datacenters
+
+We scraped data on datacenters location from TeleGeography Cloud Infrastructure Map. They contain only the datacenters owned by the major players in the cloud industry[^5]. For this reason, these maps must be intended as limited to those datacenters that are dedicated to the processing and storage of data from these companies, which, however, are those that cover almost all the market. Co-location datacenters are for this reason excluded, with the exception of those that are used by the aforementioned companies.
+
+[^5]: Namely: Amazon Web Services, Google Cloud, IBM Cloud, Microsoft Azure, Oracle Cloud, Alibaba Cloud, Tencent Cloud, Huawei Cloud.
+
+```{r Datacenters, message=FALSE, warning=FALSE, paged.print=TRUE}
+cloud_regions_location <- read_excel("work_data/datacenters_location/cloud_regions_dataset.xlsx") %>%
+  st_as_sf( coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(st_crs(nuts2)) %>%
+  st_join(nuts2, left = TRUE) %>% filter(!is.na(NUTS_ID)) %>%
+  group_by(NUTS_ID) %>%
+  summarise(cloud_regions = sum(number_of_datacenters)) %>%
+  st_drop_geometry()
+
+on_ramps_location <- read_excel("work_data/datacenters_location/on_ramps_dataset.xlsx") %>%
+  st_as_sf( coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(st_crs(nuts2)) %>%
+  st_join(nuts2, left = TRUE) %>% filter(!is.na(NUTS_ID)) %>% 
+  group_by(NUTS_ID) %>% summarise(on_ramps = n()) %>%
+  st_drop_geometry()
+
+local_zones_location <- read_excel("work_data/datacenters_location/local_zones_dataset.xlsx") %>%
+  st_as_sf( coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(st_crs(nuts2)) %>%
+  st_join(nuts2, left = TRUE) %>% filter(!is.na(NUTS_ID)) %>% 
+  group_by(NUTS_ID) %>% summarise(local_zones = n()) %>%
+  st_drop_geometry()
+
+regional_datacenters <- cloud_regions_location %>% 
+  full_join(on_ramps_location) %>%
+  full_join(local_zones_location) %>%
+  replace(is.na(.), 0) %>% 
+  mutate(total_datacenters = cloud_regions + local_zones + on_ramps) %>% 
+  right_join(nuts2, by = "NUTS_ID")
+
+#%>% mutate(NUTS_ID = as.factor(NUTS_ID), rank = rank(-total, ties.method = "max" ))
+
+```
+
+# Subsea cables landing
+
+For details on the extraction of landing points, refer to code `landing_pts.R`.
+
+```{r}
+subsea_cable_landing_points <- readRDS("work_data/instruments_for_datacenters/subsea_cable_landing_points.rds") %>%
+  select(NUTS_ID, landing_count) %>% st_drop_geometry() %>%
+  mutate(landing_count = ifelse(landing_count == 0, NA, landing_count))
+```
+
+# Coastline data
+
+Computing effort needed
+
+# Final merge
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+nuts2_data <- nuts2 %>% 
+  right_join(nuts2_STAT  %>% st_drop_geometry()) %>%
+  right_join(regional_datacenters %>% st_drop_geometry()) %>% 
+  right_join(regional_hydro  %>% st_drop_geometry()) %>% 
+  right_join(subsea_cable_landing_points) %>%
+  relocate(time_period, country,  .after = NUTS_ID)
+
+saveRDS(nuts2_data, "work_data/instruments_for_datacenters/nuts2_infrastructure_dataset.Rds")
+
+```
